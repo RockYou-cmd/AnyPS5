@@ -72,6 +72,7 @@ constexpr int NET_SOCK_RAW = 3;
 constexpr int NET_SOL_SOCKET = 0xFFFF;
 constexpr int NET_SO_SNDTIMEO = 0x1005;
 constexpr int NET_SO_RCVTIMEO = 0x1006;
+constexpr int NET_SO_ERROR = 0x1007;
 constexpr int NET_SO_NBIO = 0x1200;
 constexpr int NET_MSG_PEEK = 0x2;
 constexpr int NET_MSG_TRUNC = 0x10;
@@ -90,8 +91,9 @@ bool initialize_sockets() {
     return result == 0;
 }
 void close_socket(NativeSocket socket) { closesocket(socket); }
-int native_error() {
-    switch (WSAGetLastError()) {
+int native_error(int error) {
+    switch (error) {
+        case 0: return 0;
         case WSAEWOULDBLOCK: return NET_EAGAIN;
         case WSAEINPROGRESS: return NET_EINPROGRESS;
         case WSAEALREADY: return NET_EALREADY;
@@ -115,6 +117,7 @@ int native_error() {
         default: return 5;
     }
 }
+int native_error() { return native_error(WSAGetLastError()); }
 #else
 using NativeSocket = int;
 using NativeLength = socklen_t;
@@ -122,8 +125,9 @@ constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
 constexpr int NATIVE_SEND_FLAGS = MSG_NOSIGNAL;
 bool initialize_sockets() { return true; }
 void close_socket(NativeSocket socket) { ::close(socket); }
-int native_error() {
-    switch (errno) {
+int native_error(int error) {
+    switch (error) {
+        case 0: return 0;
         case EAGAIN: return NET_EAGAIN;
 #if EWOULDBLOCK != EAGAIN
         case EWOULDBLOCK: return NET_EAGAIN;
@@ -151,10 +155,16 @@ int native_error() {
         default: return 5;
     }
 }
+int native_error() { return native_error(errno); }
 #endif
 
 struct NativeSocketHandle {
     NativeSocket value;
+#ifdef _WIN32
+    std::mutex connectMutex;
+    bool connectPending = false;
+    int consumedConnectError = 0;
+#endif
     explicit NativeSocketHandle(NativeSocket socket) : value(socket) {}
     ~NativeSocketHandle() {
         if (value != INVALID_NATIVE_SOCKET) close_socket(value);
@@ -568,11 +578,29 @@ int APS5_VABI sceNetConnect(int s, const void* addr, uint32_t addrlen) {
     NativeLength native_length = 0;
     if (!guest_to_native_address(addr, addrlen, native, native_length)) return fail(NET_EINVAL);
     if (native.ss_family != (socket.family == NET_AF_INET ? AF_INET : AF_INET6)) return fail(NET_EAFNOSUPPORT);
-    if (::connect(socket.native->value, reinterpret_cast<const sockaddr*>(&native), native_length) == 0) return 0;
 #ifdef _WIN32
-    if (WSAGetLastError() == WSAEWOULDBLOCK) return fail(NET_EINPROGRESS);
+    std::lock_guard<std::mutex> connectionLock(socket.native->connectMutex);
 #endif
+    if (::connect(socket.native->value, reinterpret_cast<const sockaddr*>(&native), native_length) == 0) {
+#ifdef _WIN32
+        socket.native->connectPending = false;
+        socket.native->consumedConnectError = 0;
+#endif
+        return 0;
+    }
+#ifdef _WIN32
+    const int error = WSAGetLastError();
+    if (error == WSAEWOULDBLOCK) {
+        socket.native->connectPending = socket.type == NET_SOCK_STREAM;
+        socket.native->consumedConnectError = 0;
+    } else if (error != WSAEALREADY && error != WSAEISCONN && error != WSAEINVAL) {
+        socket.native->connectPending = false;
+        socket.native->consumedConnectError = 0;
+    }
+    return fail(error == WSAEWOULDBLOCK ? NET_EINPROGRESS : native_error(error));
+#else
     return fail(native_error());
+#endif
 }
 
 int64_t APS5_VABI sceNetRecv(int s, void* buf, size_t len, int flags) {
@@ -794,6 +822,32 @@ int APS5_VABI sceNetGetsockopt(int s, int level, int optname, void* optval, uint
     if (level != NET_SOL_SOCKET) return fail(NET_EOPNOTSUPP);
     int value = 0;
     switch (optname) {
+        case NET_SO_ERROR: {
+#ifdef _WIN32
+            std::lock_guard<std::mutex> connectionLock(socket.native->connectMutex);
+#endif
+            int error = 0;
+            NativeLength size = sizeof(error);
+            if (::getsockopt(socket.native->value, SOL_SOCKET, SO_ERROR,
+                reinterpret_cast<char*>(&error), &size) != 0) return fail(native_error());
+#ifdef _WIN32
+            if (error != 0 && error == socket.native->consumedConnectError) {
+                error = 0;
+            } else if (socket.native->connectPending) {
+                if (error != 0) {
+                    socket.native->consumedConnectError = error;
+                    socket.native->connectPending = false;
+                } else {
+                    sockaddr_storage peer{};
+                    NativeLength peerSize = sizeof(peer);
+                    if (::getpeername(socket.native->value, reinterpret_cast<sockaddr*>(&peer), &peerSize) == 0)
+                        socket.native->connectPending = false;
+                }
+            }
+#endif
+            value = native_error(error);
+            break;
+        }
         case NET_SO_NBIO: value = socket.nonblock ? 1 : 0; break;
         case NET_SO_RCVTIMEO: value = socket.rcv_timeout_us; break;
         case NET_SO_SNDTIMEO: value = socket.snd_timeout_us; break;
